@@ -1,0 +1,67 @@
+[package]
+name = "zip"
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+time = { version = "0.3.37", default-features = false }
+
+[dependencies]
+zip = "2.2.3"
+walkdir = "2.3"
+anyhow = "1.0.97"
+clap = { version = "4.5.31", features = ["derive"] }
+flate2 = { version = "1.1.0", default-features = false, optional = true }
+zopfli = { version = "0.8.1", optional = true }
+constant_time_eq = { version = "0.3.1", optional = true }
+hmac = { version = "0.12.1", optional = true, features = ["reset"] }
+pbkdf2 = { version = "0.12.2", optional = true }
+rand = { version = "0.9.0", optional = true }
+sha1 = { version = "0.10.6", optional = true }
+zeroize = { version = "1.8.1", optional = true, features = ["zeroize_derive"] }
+aes = { version = "0.8.4", optional = true }
+bzip2 = { version = "0.5.2", optional = true }
+deflate64 = { version = "0.1.9", optional = true }
+lzma-rs = { version = "0.3.0", default-features = false, optional = true }
+time = { workspace = true, optional = true, features = ["std"] }
+zstd = { version = "0.13.3", optional = true, default-features = false }
+crossterm = "0.28.1"
+indicatif = "0.17.11"
+rayon = "1.5"
+memmap2 = "0.9.5"
+crossbeam-channel = "0.5.14"
+[dev-dependencies]
+time = { workspace = true, features = ["formatting", "macros"] }
+
+[features]
+aes-crypto = [
+    "aes",
+    "constant_time_eq",
+    "hmac",
+    "pbkdf2",
+    "sha1",
+    "rand",
+    "zeroize",
+]
+
+_deflate-any = []
+default = [
+    "aes-crypto",
+    "bzip2",
+    "deflate64",
+    "deflate",
+    "lzma",
+    "time",
+    "zstd",
+    "xz",
+]
+xz = ["lzma-rs/raw_decoder"]
+lzma = ["lzma-rs/stream"]
+deflate = ["flate2/rust_backend", "deflate-zopfli", "deflate-flate2"]
+deflate-flate2 = ["flate2/any_impl", "_deflate-any"]
+# DEPRECATED: previously enabled `flate2/miniz_oxide` which is equivalent to `flate2/rust_backend`
+# deflate-miniz = ["deflate", "deflate-flate2"]
+deflate-zlib = ["flate2/zlib", "deflate-flate2"]
+deflate-zlib-ng = ["flate2/zlib-ng", "deflate-flate2"]
+deflate-zopfli = ["zopfli", "_deflate-any"]
+constant_time_eq = ["dep:constant_time_eq"]
