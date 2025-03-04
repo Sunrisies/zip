@@ -30,7 +30,7 @@ struct Args {
     #[arg(help = "目标压缩文件的路径")]
     destination: PathBuf,
     // 压缩方法
-    #[arg(value_enum, help = "选择压缩方法")]
+    #[arg(value_enum, default_value_t = CompressionMethod::Deflated, help = "选择压缩方法")]
     compression_method: CompressionMethod,
     #[arg(short, long, default_value_t = 4, help = "压缩线程数")]
     threads: usize,
@@ -125,7 +125,6 @@ fn zip_dir<T>(
     writer: T,
     method: zip::CompressionMethod,
     total_files: usize,
-    processed_files: &mut usize,
 ) -> anyhow::Result<()>
 where
     T: Write + Seek,
@@ -152,7 +151,6 @@ where
             .to_str()
             .map(|s| s.replace("\\", "/"))
             .unwrap_or_default();
-        // let path_as_string = name.display().to_string();
         let path_as_string = name
             .to_str()
             .map(|s| s.replace("\\", "/"))
@@ -170,7 +168,6 @@ where
             zip.add_directory(&name_display, options)
                 .with_context(|| format!("无法将目录 {} 添加到 ZIP 文件", name_display))?;
         }
-        *processed_files += 1;
         pb.inc(1);
     }
     zip.finish()?;
@@ -204,7 +201,6 @@ fn doit(
     //     file,
     //     method,
     //     total_files,
-    //     &mut processed_files,
     // )?;
     // : 160.7739351s
     // 记录结束时间
@@ -283,46 +279,7 @@ fn parallel_compress(
         .unwrap()
         .install(|| {
             files.par_iter().enumerate().for_each(|(index, entry)| {
-                // let content = get_file_content(path)?;
-                let zip_clone = zip.clone();
-                let prefix = Path::new(src_dir);
-                let path = entry.path();
-                let name = path
-                    .strip_prefix(prefix)
-                    .with_context(|| format!("路径 {:?} 不是前缀 {:?}", prefix, path))
-                    .unwrap();
-                let mut zip_writer = zip_clone.lock().unwrap();
-                let path_display = path.display().to_string();
-                let name_display = name
-                    .to_str()
-                    .map(|s| s.replace("\\", "/"))
-                    .unwrap_or_default();
-                if path.is_file() {
-                    // 打印文件大小
-                    let file = File::open(&path)
-                        .with_context(|| format!("Failed to open file {}", path_display))
-                        .unwrap();
-                    let mmap = unsafe { MmapOptions::new().map(&file) }
-                        .with_context(|| format!("Failed to map file {}", path_display))
-                        .unwrap();
-                    let _ = zip_writer
-                        .start_file(&name_display, options)
-                        .with_context(|| format!("无法将文件 {} 添加到 ZIP 文件", path_display));
-                    // let _ = zip_writer
-                    //     .write_all(&mmap)
-                    //     .with_context(|| format!("无法将文件 {} 写入 ZIP 文件", path_display));
-                }
-                // else if !name.as_os_str().is_empty() {
-                //     // let _ = zip_writer
-                //     //     .add_directory(&name_display, options)
-                //     //     .with_context(|| format!("无法将目录 {} 添加到 ZIP 文件", name_display));
-                // }
-                let next_index_clone = Arc::clone(&next_index);
-                let mut next = next_index_clone.lock().unwrap();
-                *next += 1;
-                if *next % 10 == 0 {
-                    pb.set_position(*next as u64);
-                }
+                compress_file(zip.clone(), entry, options, &pb, src_dir, next_index.clone());
             });
         });
 
@@ -331,11 +288,44 @@ fn parallel_compress(
     writer_thread.join().unwrap();
     Ok(())
 }
-// // 获取文件内容并返回内存映射
-// fn get_file_content(path: &Path) -> Result<Option<Vec<u8>>> {
-//     let file = File::open(path)
-//         .with_context(|| format!("无法打开文件 {:?}", path))?;
-//     let mmap = unsafe { MmapOptions::new().map(&file) }
-//         .with_context(|| format!("无法映射文件 {:?}", path))?;
-//     Ok(Some(mmap.to_vec()))
-// }
+// 压缩文件
+fn compress_file(zip_clone: Arc<Mutex<zip::ZipWriter<BufWriter<File>>>>, entry: &DirEntry, options: SimpleFileOptions, pb: &ProgressBar, src_dir: &Path, next_index: Arc<Mutex<usize>>) {
+    let prefix = Path::new(src_dir);
+    let path = entry.path();
+    let name = path
+        .strip_prefix(prefix)
+        .with_context(|| format!("路径 {:?} 不是前缀 {:?}", prefix, path))
+        .unwrap();
+    let mut zip_writer = zip_clone.lock().unwrap();
+    let path_display = path.display().to_string();
+    let name_display = name
+        .to_str()
+        .map(|s| s.replace("\\", "/"))
+        .unwrap_or_default();
+    if path.is_file() {
+        // 打印文件大小
+        let file = File::open(&path)
+            .with_context(|| format!("Failed to open file {}", path_display))
+            .unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file) }
+            .with_context(|| format!("Failed to map file {}", path_display))
+            .unwrap();
+        let _ = zip_writer
+            .start_file(&name_display, options)
+            .with_context(|| format!("无法将文件 {} 添加到 ZIP 文件", path_display));
+        let _ = zip_writer
+            .write_all(&mmap)
+            .with_context(|| format!("无法将文件 {} 写入 ZIP 文件", path_display));
+    }
+    // else if !name.as_os_str().is_empty() {
+    //     // let _ = zip_writer
+    //     //     .add_directory(&name_display, options)
+    //     //     .with_context(|| format!("无法将目录 {} 添加到 ZIP 文件", name_display));
+    // }
+    let next_index_clone = Arc::clone(&next_index);
+    let mut next = next_index_clone.lock().unwrap();
+    *next += 1;
+    if *next % 10 == 0 {
+        pb.set_position(*next as u64);
+    }
+}
