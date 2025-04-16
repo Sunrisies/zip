@@ -13,8 +13,10 @@ use std::io::prelude::*;
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::thread;
 use std::time::Instant;
 use walkdir::{DirEntry, WalkDir};
@@ -136,7 +138,7 @@ where
 
     let prefix = Path::new(prefix);
     let mut buffer = Vec::new();
-    let pb = progress_bar_init(total_files as u64)?;
+    let pb = progress_bar_init(Some(total_files as u64))?;
 
     for entry in it {
         // println!("开始压缩: {:?} 个文件", entry);
@@ -183,45 +185,56 @@ fn doit(
     if !Path::new(src_dir).is_dir() {
         return Err(ZipError::FileNotFound.into());
     }
-    let path = Path::new(dst_file);
-    let file = File::create(path).unwrap();
-    let walkdir = WalkDir::new(path);
-    let it = walkdir.into_iter();
-    let walkdir = WalkDir::new(src_dir);
-    let it: walkdir::IntoIter = walkdir.into_iter();
-    let total_files = WalkDir::new(src_dir).into_iter().count();
-    println!("开始压缩: {:?} 个文件", total_files);
+    let start1 = Instant::now();
+    // let path: &Path = Path::new(dst_file);
+    // let file = File::create(path).unwrap();
+    // let walkdir = WalkDir::new(path);
+    // let it: walkdir::IntoIter = walkdir.into_iter();
+    // let walkdir = WalkDir::new(src_dir);
+    // let it: walkdir::IntoIter = walkdir.into_iter();
+    // let total_files = WalkDir::new(src_dir).into_iter().count();
+    let end1 = Instant::now();
+    println!("压缩完成，耗时: {:?}", end1 - start1);
+    // println!("开始压缩: {:?} 个文件", total_files);
     // 记录开始时间
     let start = Instant::now();
-
     parallel_compress(src_dir, dst_file, method, threads).context("压缩失败")?;
-    // zip_dir(
-    //     &mut it.filter_map(|e| e.ok()),
-    //     src_dir,
-    //     file,
-    //     method,
-    //     total_files,
-    // )?;
-    // : 160.7739351s
     // 记录结束时间
     let end = Instant::now();
     // 计算并打印压缩所花费的时间
     println!("压缩完成，耗时: {:?}", end - start);
     Ok(())
 }
+fn progress_bar_init(total_files: Option<u64>) -> anyhow::Result<ProgressBar> {
+    let pb = match total_files {
+        Some(total) => ProgressBar::new(total),
+        None => ProgressBar::new_spinner(),
+    };
 
-fn progress_bar_init(total_files: u64) -> anyhow::Result<ProgressBar> {
-    let pb = ProgressBar::new(total_files);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-    );
+    let style = match total_files {
+        Some(_) => ProgressStyle::default_bar().template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+        )?,
+        None => ProgressStyle::default_spinner()
+            .template("{spinner:.green} 已扫描: {pos} 个文件 [{elapsed_precise}]")?,
+    };
+
+    pb.set_style(style.progress_chars("#>-"));
     Ok(pb)
 }
+
+// fn progress_bar_init(total_files: u64) -> anyhow::Result<ProgressBar> {
+//     let pb = ProgressBar::new(total_files);
+//     pb.set_style(
+//         ProgressStyle::default_bar()
+//             .template(
+//                 "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+//             )
+//             .unwrap()
+//             .progress_chars("#>-"),
+//     );
+//     Ok(pb)
+// }
 
 /// 核心压缩逻辑
 fn parallel_compress(
@@ -230,66 +243,172 @@ fn parallel_compress(
     method: zip::CompressionMethod,
     num_threads: usize,
 ) -> anyhow::Result<()> {
+    let scan_pb = progress_bar_init(None)?;
     let (files, total_size) = {
         let start = Instant::now();
+
         let mut total_size = 0;
         let files: Vec<_> = WalkDir::new(src_dir)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
-            .inspect(|e| total_size += e.metadata().map(|m| m.len()).unwrap_or(0))
+            .inspect(|e| {
+                total_size += e.metadata().map(|m| m.len()).unwrap_or(0);
+                scan_pb.inc(1); // 更新进度条
+            })
             .collect();
+        scan_pb.finish_and_clear(); // 完成后清理进度条
         println!(
-            "[1/4] 扫描完成: 找到 {} 个文件 ({} MB), 耗时 {:?}",
+            "[1/4] 扫描完成: 找到 {} 个文件 ({:.2} {}), 耗时 {:?}",
             files.len(),
-            total_size / 1024 / 1024,
+            if total_size >= 1024 * 1024 * 1024 {
+                total_size as f64 / 1024.0 / 1024.0 / 1024.0
+            } else {
+                total_size as f64 / 1024.0 / 1024.0
+            },
+            if total_size >= 1024 * 1024 * 1024 {
+                "GB"
+            } else {
+                "MB"
+            },
             start.elapsed()
         );
         (files, total_size)
     };
-    let pb = progress_bar_init(files.len() as u64)?;
-
+    let pb = progress_bar_init(Some(files.len() as u64))?;
     println!("压缩管道:{}", num_threads);
-    // 创建通信管道
-    let (tx, rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) = bounded(num_threads * 2);
 
-    let dst_file_clone = dst_file.to_path_buf();
-    let file = BufWriter::new(File::create(dst_file).unwrap());
-    let files = Arc::new(files);
-
-    // 启动写入线程
-    let writer_thread = thread::spawn(move || {
-        let mut buffer = BTreeMap::new();
-        // 接收并缓存数据块
-        for (index, data) in rx {
-            buffer.insert(index, data);
-        }
-    });
+    // 创建带缓冲区的ZIP写入器
+    let file = BufWriter::with_capacity(1024 * 1024, File::create(dst_file)?);
+    let zip_writer = zip::ZipWriter::new(file);
+    let zip = Arc::new(RwLock::new(zip_writer));
+    let write_lock_interval = 10; // 每处理10个文件释放一次锁
+                                  // 原子计数器用于进度跟踪
+    let counter = Arc::new(AtomicUsize::new(0));
     let options = SimpleFileOptions::default()
         .compression_method(method)
         .unix_permissions(0o755);
-    let zip_file = BufWriter::new(File::create(dst_file).unwrap());
-    let zip = Arc::new(Mutex::new(zip::ZipWriter::new(zip_file)));
-    let next_index = Arc::new(Mutex::new(0));
-    // 并行压缩线程池
 
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build()
-        .unwrap()
-        .install(|| {
-            files.par_iter().enumerate().for_each(|(index, entry)| {
-                compress_file(zip.clone(), entry, options, &pb, src_dir, next_index.clone());
-            });
-        });
+    // 使用Rayon全局线程池
+    files.par_iter().try_for_each(|entry| {
+        let path = entry.path();
+        let name = path
+            .strip_prefix(src_dir)
+            .with_context(|| format!("路径 {:?} 不是前缀 {:?}", src_dir, path))?
+            .to_str()
+            .map(|s| s.replace("\\", "/"))
+            .ok_or_else(|| anyhow::anyhow!("路径包含无效字符"))?;
 
-    // 等待写入完成
-    drop(tx); // 关闭发送端
-    writer_thread.join().unwrap();
+        // // 内存映射优化
+        // let mmap = unsafe { MmapOptions::new().map(&File::open(path)?) }?;
+
+        // // 分段写入锁优化
+        // {
+        //     let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
+        //     if path.is_file() {
+        //         writer.start_file(&name, options)?;
+        //         writer.write_all(&mmap)?;
+        //     } else if !name.is_empty() {
+        //         writer.add_directory(&name, options)?;
+        //     }
+        // }
+        // 修改3：限制锁作用域
+        let result = (|| -> anyhow::Result<()> {
+            let mmap = unsafe { MmapOptions::new().map(&File::open(path)?) }?;
+
+            // 按间隔获取锁
+            if counter.load(Ordering::Relaxed) % write_lock_interval == 0 {
+                let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
+                if path.is_file() {
+                    writer.start_file(&name, options)?;
+                    writer.write_all(&mmap)?;
+                }
+            } else {
+                // 无锁写入（需要确保线程安全）
+                let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
+                writer.write_all(&mmap)?;
+            }
+            // 修改4：强制释放内存映射
+            drop(mmap);
+
+            // 原子更新进度
+            let prev = counter.fetch_add(1, Ordering::Relaxed);
+            if prev % 10 == 0 {
+                pb.set_position(prev as u64);
+            }
+            Ok(())
+        })();
+
+        result
+    })?;
+
+    // 修改最后的完成方式
+    let zip_writer = Arc::try_unwrap(zip)
+        .map_err(|_| anyhow::anyhow!("存在未释放的ZIP写入器引用"))?
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("锁污染错误"))?;
+
+    let mut file = zip_writer.finish()?;
+    file.flush()?;
+    pb.finish_with_message("完成");
+
+    // let pb = progress_bar_init(Some(files.len() as u64))?;
+
+    // println!("压缩管道:{}", num_threads);
+    // // 创建通信管道
+    // let (tx, rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) = bounded(num_threads * 2);
+
+    // let dst_file_clone = dst_file.to_path_buf();
+    // let file = BufWriter::new(File::create(dst_file).unwrap());
+    // let files = Arc::new(files);
+
+    // // 启动写入线程
+    // let writer_thread = thread::spawn(move || {
+    //     let mut buffer = BTreeMap::new();
+    //     // 接收并缓存数据块
+    //     for (index, data) in rx {
+    //         buffer.insert(index, data);
+    //     }
+    // });
+    // let options = SimpleFileOptions::default()
+    //     .compression_method(method)
+    //     .unix_permissions(0o755);
+    // let zip_file = BufWriter::new(File::create(dst_file).unwrap());
+    // let zip = Arc::new(Mutex::new(zip::ZipWriter::new(zip_file)));
+    // let next_index = Arc::new(Mutex::new(0));
+    // // 并行压缩线程池
+
+    // rayon::ThreadPoolBuilder::new()
+    //     .num_threads(num_threads)
+    //     .build()
+    //     .unwrap()
+    //     .install(|| {
+    //         files.par_iter().enumerate().for_each(|(index, entry)| {
+    //             compress_file(
+    //                 zip.clone(),
+    //                 entry,
+    //                 options,
+    //                 &pb,
+    //                 src_dir,
+    //                 next_index.clone(),
+    //             );
+    //         });
+    //     });
+
+    // // 等待写入完成
+    // drop(tx); // 关闭发送端
+    // writer_thread.join().unwrap();
     Ok(())
 }
 // 压缩文件
-fn compress_file(zip_clone: Arc<Mutex<zip::ZipWriter<BufWriter<File>>>>, entry: &DirEntry, options: SimpleFileOptions, pb: &ProgressBar, src_dir: &Path, next_index: Arc<Mutex<usize>>) {
+fn compress_file(
+    zip_clone: Arc<Mutex<zip::ZipWriter<BufWriter<File>>>>,
+    entry: &DirEntry,
+    options: SimpleFileOptions,
+    pb: &ProgressBar,
+    src_dir: &Path,
+    next_index: Arc<Mutex<usize>>,
+) {
     let prefix = Path::new(src_dir);
     let path = entry.path();
     let name = path
