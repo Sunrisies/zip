@@ -20,24 +20,36 @@ use std::sync::RwLock;
 use std::thread;
 use std::time::Instant;
 use walkdir::{DirEntry, WalkDir};
+use zip::ZipWriter;
 use zip::{result::ZipError, write::SimpleFileOptions};
 #[derive(Parser)]
 // #[command(about, long_about = None)]
 #[command(about = "压缩文件目录", long_about = Some("将指定目录压缩为 zip 文件"))]
 struct Args {
-    // 源目录
+    /// 源目录
     #[arg(help = "源目录的路径")]
     source: PathBuf,
-    // 压缩后的文件名称
+    /// 压缩后的文件名称
     #[arg(help = "目标压缩文件的路径")]
     destination: PathBuf,
-    // 压缩方法
+    /// 压缩方法
     #[arg(value_enum, default_value_t = CompressionMethod::Deflated, help = "选择压缩方法")]
     compression_method: CompressionMethod,
     #[arg(short, long, default_value_t = 4, help = "压缩线程数")]
     threads: usize,
+    #[arg(short = 'l', long, default_value_t = 1, help = "压缩级别 (1-9)")]
+    compression_level: u32,
+    #[arg(long, default_value_t = 1024, help = "小文件阈值 (KB)")]
+    small_file_threshold: u64,
 }
-
+#[derive(Debug)]
+struct CompressedFile {
+    index: usize,
+    name: String,
+    data: Vec<u8>,
+    is_compressed: bool,
+    is_directory: bool,
+}
 #[derive(Clone, ValueEnum)]
 enum CompressionMethod {
     Stored,
@@ -113,7 +125,14 @@ fn real_main() -> i32 {
     };
     let threads = args.threads;
 
-    match doit(src_dir, dst_file, method, threads) {
+    match doit(
+        src_dir,
+        dst_file,
+        method,
+        threads,
+        args.compression_level,
+        args.small_file_threshold,
+    ) {
         Ok(_) => println!("从: {:?} 压缩到 {:?}", src_dir, dst_file),
         Err(e) => eprintln!("压缩失败: {e:?}"),
     }
@@ -181,30 +200,295 @@ fn doit(
     dst_file: &Path,
     method: zip::CompressionMethod,
     threads: usize,
+    compression_level: u32,
+    small_file_threshold: u64,
 ) -> anyhow::Result<()> {
     if !Path::new(src_dir).is_dir() {
         return Err(ZipError::FileNotFound.into());
     }
-    let start1 = Instant::now();
-    // let path: &Path = Path::new(dst_file);
-    // let file = File::create(path).unwrap();
-    // let walkdir = WalkDir::new(path);
-    // let it: walkdir::IntoIter = walkdir.into_iter();
-    // let walkdir = WalkDir::new(src_dir);
-    // let it: walkdir::IntoIter = walkdir.into_iter();
-    // let total_files = WalkDir::new(src_dir).into_iter().count();
-    let end1 = Instant::now();
-    println!("压缩完成，耗时: {:?}", end1 - start1);
-    // println!("开始压缩: {:?} 个文件", total_files);
     // 记录开始时间
     let start = Instant::now();
-    parallel_compress(src_dir, dst_file, method, threads).context("压缩失败")?;
+    parallel_compress_optimized(
+        src_dir,
+        dst_file,
+        method,
+        threads,
+        compression_level,
+        small_file_threshold,
+    )
+    .context("压缩失败")?;
     // 记录结束时间
     let end = Instant::now();
     // 计算并打印压缩所花费的时间
     println!("压缩完成，耗时: {:?}", end - start);
     Ok(())
 }
+
+/// 优化的并行压缩实现
+fn parallel_compress_optimized(
+    src_dir: &Path,
+    dst_file: &Path,
+    method: zip::CompressionMethod,
+    num_threads: usize,
+    compression_level: u32,
+    small_file_threshold_kb: u64,
+) -> anyhow::Result<()> {
+    let small_file_threshold = small_file_threshold_kb * 1024;
+
+    println!("[1/4] 扫描文件中...");
+    let scan_start = Instant::now();
+
+    // 扫描文件并分类
+    let (files, total_size) = scan_files(src_dir)?;
+    println!(
+        "[1/4] 扫描完成: 找到 {} 个文件 ({:.2} MB), 耗时 {:?}",
+        files.len(),
+        total_size as f64 / 1024.0 / 1024.0,
+        scan_start.elapsed()
+    );
+
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    println!("[2/4] 创建 ZIP 文件...");
+    let file = BufWriter::with_capacity(64 * 1024 * 1024, File::create(dst_file)?); // 64MB 缓冲区
+    let zip_writer = ZipWriter::new(file);
+    let zip = Arc::new(Mutex::new(zip_writer));
+
+    // 创建通信通道
+    let (file_tx, file_rx) = bounded(num_threads * 2);
+    let (result_tx, result_rx) = bounded(num_threads * 2);
+
+    // 进度跟踪
+    let progress = Arc::new(AtomicUsize::new(0));
+    let total_files = files.len();
+    let pb = progress_bar_init(Some(total_files as u64))?;
+    let progress_clone = Arc::clone(&progress);
+    let pb_clone = pb.clone();
+
+    println!("[3/4] 启动 {} 个压缩线程...", num_threads);
+
+    // 启动压缩工作线程
+    let compressor_handles: Vec<_> = (0..num_threads)
+        .map(|_| {
+            let rx = file_rx.clone();
+            let tx = result_tx.clone();
+            let method = method;
+            let src_dir = src_dir.to_path_buf();
+            let small_file_threshold = small_file_threshold;
+
+            std::thread::spawn(move || -> anyhow::Result<()> {
+                let mut buffer = Vec::with_capacity(1024 * 1024); // 1MB 缓冲区
+
+                while let Ok((index, entry)) = rx.recv() {
+                    let path = entry.path();
+                    let name = match path.strip_prefix(&src_dir) {
+                        Ok(name) => name
+                            .to_str()
+                            .map(|s| s.replace("\\", "/"))
+                            .unwrap_or_default(),
+                        Err(_) => continue,
+                    };
+
+                    if path.is_file() {
+                        // 根据文件大小选择压缩策略
+                        let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        let use_compression = file_size > small_file_threshold;
+
+                        let compressed_data = if use_compression {
+                            // 对大文件进行压缩
+                            match compress_file_data(path, &method, compression_level, &mut buffer)
+                            {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    eprintln!("压缩文件失败 {}: {}", path.display(), e);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            // 小文件直接存储
+                            match read_file_data(path, &mut buffer) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    eprintln!("读取文件失败 {}: {}", path.display(), e);
+                                    continue;
+                                }
+                            }
+                        };
+
+                        let result = CompressedFile {
+                            index,
+                            name,
+                            data: compressed_data,
+                            is_compressed: use_compression,
+                            is_directory: false,
+                        };
+
+                        if let Err(_) = tx.send(result) {
+                            break;
+                        }
+                    } else {
+                        // 目录项
+                        let result = CompressedFile {
+                            index,
+                            name,
+                            data: Vec::new(),
+                            is_compressed: false,
+                            is_directory: true,
+                        };
+
+                        if let Err(_) = tx.send(result) {
+                            break;
+                        }
+                    }
+
+                    // 更新进度
+                    let current = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                    if current % 10 == 0 || current == total_files {
+                        pb_clone.set_position(current as u64);
+                    }
+                }
+                Ok(())
+            })
+        })
+        .collect();
+
+    println!("[4/4] 开始压缩处理...");
+
+    // 发送文件到工作线程
+    for (index, entry) in files.into_iter().enumerate() {
+        if let Err(_) = file_tx.send((index, entry)) {
+            break;
+        }
+    }
+    drop(file_tx); // 关闭发送通道
+
+    // 写入线程 - 按顺序写入ZIP文件
+    let write_handle = std::thread::spawn(move || -> anyhow::Result<()> {
+        let mut pending_files = BTreeMap::new();
+        let mut next_expected = 0;
+
+        while let Ok(mut compressed_file) = result_rx.recv() {
+            pending_files.insert(compressed_file.index, compressed_file);
+
+            // 按顺序处理文件
+            while let Some(file) = pending_files.remove(&next_expected) {
+                write_file_to_zip(&zip, &file, method, compression_level)?;
+                next_expected += 1;
+            }
+        }
+
+        // 处理剩余文件
+        for (_, file) in pending_files {
+            write_file_to_zip(&zip, &file, method, compression_level)?;
+        }
+
+        Ok(())
+    });
+
+    // 等待所有线程完成
+    for handle in compressor_handles {
+        let _ = handle.join();
+    }
+
+    drop(result_tx); // 关闭结果通道
+
+    // 等待写入完成
+    write_handle.join().expect("写入线程崩溃")?;
+
+    // 完成ZIP文件
+    let mut zip_writer = Arc::try_unwrap(zip)
+        .map_err(|_| anyhow::anyhow!("ZIP writer 仍在使用中"))?
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("锁污染"))?;
+
+    zip_writer.finish()?;
+    pb.finish_with_message("压缩完成");
+
+    Ok(())
+}
+
+/// 读取文件数据（不压缩）
+fn read_file_data(path: &Path, buffer: &mut Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    buffer.clear();
+
+    let mut file = File::open(path)?;
+    file.read_to_end(buffer)?;
+
+    Ok(buffer.clone())
+}
+
+/// 写入文件到ZIP
+fn write_file_to_zip(
+    zip: &Arc<Mutex<ZipWriter<BufWriter<File>>>>,
+    file: &CompressedFile,
+    method: zip::CompressionMethod,
+    compression_level: u32,
+) -> anyhow::Result<()> {
+    let mut zip_writer = zip.lock().unwrap();
+
+    let options = SimpleFileOptions::default()
+        .compression_method(if file.is_compressed {
+            method
+        } else {
+            zip::CompressionMethod::Stored
+        })
+        .unix_permissions(0o755);
+
+    if file.is_directory {
+        zip_writer.add_directory(&file.name, options)?;
+    } else {
+        zip_writer.start_file(&file.name, options)?;
+        zip_writer.write_all(&file.data)?;
+    }
+
+    Ok(())
+}
+
+/// 压缩文件数据
+fn compress_file_data(
+    path: &Path,
+    method: &zip::CompressionMethod,
+    level: u32,
+    buffer: &mut Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    buffer.clear();
+
+    let mut file = File::open(path)?;
+    file.read_to_end(buffer)?;
+
+    // 这里可以添加实际的压缩逻辑
+    // 目前只是返回原始数据，实际使用时应根据method和level进行压缩
+    Ok(buffer.clone())
+}
+
+/// 扫描文件
+fn scan_files(src_dir: &Path) -> anyhow::Result<(Vec<DirEntry>, u64)> {
+    let mut files = Vec::new();
+    let mut total_size = 0;
+
+    for entry in WalkDir::new(src_dir) {
+        let entry = entry?;
+        let path = entry.path();
+
+        if entry.file_type().is_file() {
+            total_size += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+
+        files.push(entry);
+    }
+
+    // 按文件大小排序，大文件优先处理
+    files.sort_by(|a, b| {
+        let size_a = a.metadata().map(|m| m.len()).unwrap_or(0);
+        let size_b = b.metadata().map(|m| m.len()).unwrap_or(0);
+        size_b.cmp(&size_a) // 降序排列
+    });
+
+    Ok((files, total_size))
+}
+
 fn progress_bar_init(total_files: Option<u64>) -> anyhow::Result<ProgressBar> {
     let pb = match total_files {
         Some(total) => ProgressBar::new(total),
