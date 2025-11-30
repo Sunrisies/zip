@@ -371,6 +371,8 @@ fn parallel_compress_optimized(
         }
     }
     drop(file_tx); // 关闭发送通道
+                   // 在创建写入线程之前，为写入线程创建一个 zip 的克隆
+    let write_zip = Arc::clone(&zip);
 
     // 写入线程 - 按顺序写入ZIP文件
     let write_handle = std::thread::spawn(move || -> anyhow::Result<()> {
@@ -382,14 +384,14 @@ fn parallel_compress_optimized(
 
             // 按顺序处理文件
             while let Some(file) = pending_files.remove(&next_expected) {
-                write_file_to_zip(&zip, &file, method, compression_level)?;
+                write_file_to_zip(&write_zip, &file, method, compression_level)?;
                 next_expected += 1;
             }
         }
 
         // 处理剩余文件
         for (_, file) in pending_files {
-            write_file_to_zip(&zip, &file, method, compression_level)?;
+            write_file_to_zip(&write_zip, &file, method, compression_level)?;
         }
 
         Ok(())
