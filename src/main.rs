@@ -208,15 +208,16 @@ fn doit(
     }
     // 记录开始时间
     let start = Instant::now();
-    parallel_compress_optimized(
-        src_dir,
-        dst_file,
-        method,
-        threads,
-        compression_level,
-        small_file_threshold,
-    )
-    .context("压缩失败")?;
+    parallel_compress(src_dir, dst_file, method, threads)?;
+    // parallel_compress_optimized(
+    //     src_dir,
+    //     dst_file,
+    //     method,
+    //     threads,
+    //     compression_level,
+    //     small_file_threshold,
+    // )
+    // .context("压缩失败")?;
     // 记录结束时间
     let end = Instant::now();
     // 计算并打印压缩所花费的时间
@@ -285,12 +286,12 @@ fn parallel_compress_optimized(
             let thread_progress = Arc::clone(&progress_clone);
             let thread_pb = pb_clone.clone();
             let thread_total_files = total_files;
-
             std::thread::spawn(move || -> anyhow::Result<()> {
                 let mut buffer = Vec::with_capacity(1024 * 1024); // 1MB 缓冲区
 
                 while let Ok((index, entry)) = rx.recv() {
                     let path = entry.path();
+
                     let name = match path.strip_prefix(&src_dir) {
                         Ok(name) => name
                             .to_str()
@@ -303,7 +304,7 @@ fn parallel_compress_optimized(
                         // 根据文件大小选择压缩策略
                         let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                         let use_compression = file_size > small_file_threshold;
-
+                        println!("{}: {},{}", name, file_size, use_compression);
                         let compressed_data = if use_compression {
                             // 对大文件进行压缩
                             match compress_file_data(path, &method, compression_level, &mut buffer)
@@ -345,7 +346,6 @@ fn parallel_compress_optimized(
                             is_compressed: false,
                             is_directory: true,
                         };
-
                         if let Err(_) = tx.send(result) {
                             break;
                         }
@@ -380,6 +380,10 @@ fn parallel_compress_optimized(
         let mut next_expected = 0;
 
         while let Ok(mut compressed_file) = result_rx.recv() {
+            println!(
+                "接收文件: {} (索引: {})",
+                compressed_file.name, compressed_file.index
+            );
             pending_files.insert(compressed_file.index, compressed_file);
 
             // 按顺序处理文件
@@ -592,7 +596,7 @@ fn parallel_compress(
             .to_str()
             .map(|s| s.replace("\\", "/"))
             .ok_or_else(|| anyhow::anyhow!("路径包含无效字符"))?;
-
+        println!("name:{}", name);
         // // 内存映射优化
         // let mmap = unsafe { MmapOptions::new().map(&File::open(path)?) }?;
 
@@ -611,19 +615,19 @@ fn parallel_compress(
             let mmap = unsafe { MmapOptions::new().map(&File::open(path)?) }?;
 
             // 按间隔获取锁
-            if counter.load(Ordering::Relaxed) % write_lock_interval == 0 {
-                let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
-                if path.is_file() {
-                    writer.start_file(&name, options)?;
-                    writer.write_all(&mmap)?;
-                }
-            } else {
-                // 无锁写入（需要确保线程安全）
-                let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
-                writer.write_all(&mmap)?;
-            }
-            // 修改4：强制释放内存映射
-            drop(mmap);
+            // if counter.load(Ordering::Relaxed) % write_lock_interval == 0 {
+            //     let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
+            //     if path.is_file() {
+            //         writer.start_file(&name, options)?;
+            //         writer.write_all(&mmap)?;
+            //     }
+            // } else {
+            //     // 无锁写入（需要确保线程安全）
+            //     let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
+            //     writer.write_all(&mmap)?;
+            // }
+            // // 修改4：强制释放内存映射
+            // drop(mmap);
 
             // 原子更新进度
             let prev = counter.fetch_add(1, Ordering::Relaxed);
@@ -645,53 +649,6 @@ fn parallel_compress(
     let mut file = zip_writer.finish()?;
     file.flush()?;
     pb.finish_with_message("完成");
-
-    // let pb = progress_bar_init(Some(files.len() as u64))?;
-
-    // println!("压缩管道:{}", num_threads);
-    // // 创建通信管道
-    // let (tx, rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) = bounded(num_threads * 2);
-
-    // let dst_file_clone = dst_file.to_path_buf();
-    // let file = BufWriter::new(File::create(dst_file).unwrap());
-    // let files = Arc::new(files);
-
-    // // 启动写入线程
-    // let writer_thread = thread::spawn(move || {
-    //     let mut buffer = BTreeMap::new();
-    //     // 接收并缓存数据块
-    //     for (index, data) in rx {
-    //         buffer.insert(index, data);
-    //     }
-    // });
-    // let options = SimpleFileOptions::default()
-    //     .compression_method(method)
-    //     .unix_permissions(0o755);
-    // let zip_file = BufWriter::new(File::create(dst_file).unwrap());
-    // let zip = Arc::new(Mutex::new(zip::ZipWriter::new(zip_file)));
-    // let next_index = Arc::new(Mutex::new(0));
-    // // 并行压缩线程池
-
-    // rayon::ThreadPoolBuilder::new()
-    //     .num_threads(num_threads)
-    //     .build()
-    //     .unwrap()
-    //     .install(|| {
-    //         files.par_iter().enumerate().for_each(|(index, entry)| {
-    //             compress_file(
-    //                 zip.clone(),
-    //                 entry,
-    //                 options,
-    //                 &pb,
-    //                 src_dir,
-    //                 next_index.clone(),
-    //             );
-    //         });
-    //     });
-
-    // // 等待写入完成
-    // drop(tx); // 关闭发送端
-    // writer_thread.join().unwrap();
     Ok(())
 }
 // 压缩文件
