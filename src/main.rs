@@ -257,8 +257,11 @@ fn parallel_compress_optimized(
     let zip = Arc::new(Mutex::new(zip_writer));
 
     // 创建通信通道
-    let (file_tx, file_rx) = bounded(num_threads * 2);
-    let (result_tx, result_rx) = bounded(num_threads * 2);
+    let (file_tx, file_rx): (Sender<(usize, DirEntry)>, Receiver<(usize, DirEntry)>) =
+        bounded(num_threads * 2);
+
+    let (result_tx, result_rx): (Sender<CompressedFile>, Receiver<CompressedFile>) =
+        bounded(num_threads * 2);
 
     // 进度跟踪
     let progress = Arc::new(AtomicUsize::new(0));
@@ -277,6 +280,11 @@ fn parallel_compress_optimized(
             let method = method;
             let src_dir = src_dir.to_path_buf();
             let small_file_threshold = small_file_threshold;
+
+            // 在每个线程中克隆需要的值，而不是移动外部变量
+            let thread_progress = Arc::clone(&progress_clone);
+            let thread_pb = pb_clone.clone();
+            let thread_total_files = total_files;
 
             std::thread::spawn(move || -> anyhow::Result<()> {
                 let mut buffer = Vec::with_capacity(1024 * 1024); // 1MB 缓冲区
@@ -343,10 +351,10 @@ fn parallel_compress_optimized(
                         }
                     }
 
-                    // 更新进度
-                    let current = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
-                    if current % 10 == 0 || current == total_files {
-                        pb_clone.set_position(current as u64);
+                    // 更新进度 - 使用线程内部的克隆版本
+                    let current = thread_progress.fetch_add(1, Ordering::Relaxed) + 1;
+                    if current % 10 == 0 || current == thread_total_files {
+                        thread_pb.set_position(current as u64);
                     }
                 }
                 Ok(())
@@ -398,7 +406,7 @@ fn parallel_compress_optimized(
     write_handle.join().expect("写入线程崩溃")?;
 
     // 完成ZIP文件
-    let mut zip_writer = Arc::try_unwrap(zip)
+    let zip_writer = Arc::try_unwrap(zip)
         .map_err(|_| anyhow::anyhow!("ZIP writer 仍在使用中"))?
         .into_inner()
         .map_err(|_| anyhow::anyhow!("锁污染"))?;
