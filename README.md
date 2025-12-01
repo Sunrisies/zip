@@ -18,7 +18,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/sunrise-zip.git
+git clone https://github.com/Sunrisies/zip.git
 cd sunrise-zip
 
 # 构建发布版本
@@ -27,7 +27,7 @@ cargo build --release
 
 ### 下载预编译二进制文件
 
-从 [Releases](https://github.com/yourusername/sunrise-zip/releases) 页面下载适合您系统的二进制文件。
+从 [Releases](https://github.com/Sunrisies/zip.git/releases) 页面下载适合您系统的二进制文件。
 
 ## 使用方法
 
