@@ -20,6 +20,8 @@ use std::sync::RwLock;
 use std::thread;
 use std::time::Instant;
 use walkdir::{DirEntry, WalkDir};
+extern crate zip as zip_lib;
+use sunrise_zip::log::init_logger;
 use zip::ZipWriter;
 use zip::{result::ZipError, write::SimpleFileOptions};
 #[derive(Parser)]
@@ -61,6 +63,7 @@ enum CompressionMethod {
 }
 
 fn main() {
+    init_logger();
     std::process::exit(real_main());
 }
 
@@ -124,14 +127,15 @@ fn real_main() -> i32 {
         }
     };
     let threads = args.threads;
-
+    let compression_level = args.compression_level;
+    let small_file_threshold = args.small_file_threshold;
     match doit(
         src_dir,
         dst_file,
         method,
         threads,
-        args.compression_level,
-        args.small_file_threshold,
+        compression_level,
+        small_file_threshold,
     ) {
         Ok(_) => println!("从: {:?} 压缩到 {:?}", src_dir, dst_file),
         Err(e) => eprintln!("压缩失败: {e:?}"),
@@ -208,7 +212,15 @@ fn doit(
     }
     // 记录开始时间
     let start = Instant::now();
-    parallel_compress(src_dir, dst_file, method, threads)?;
+    //     small_file_threshold,
+    parallel_compress(
+        src_dir,
+        dst_file,
+        method,
+        threads,
+        compression_level,
+        small_file_threshold,
+    )?;
     // parallel_compress_optimized(
     //     src_dir,
     //     dst_file,
@@ -540,7 +552,11 @@ fn parallel_compress(
     dst_file: &Path,
     method: zip::CompressionMethod,
     num_threads: usize,
+    compression_level: u32,
+    small_file_threshold_kb: u64,
 ) -> anyhow::Result<()> {
+    let small_file_threshold = small_file_threshold_kb * 1024;
+
     let scan_pb = progress_bar_init(None)?;
     let (files, total_size) = {
         let start = Instant::now();
@@ -587,6 +603,10 @@ fn parallel_compress(
         .compression_method(method)
         .unix_permissions(0o755);
 
+    let zip_arc = Arc::clone(&zip);
+
+    // 启动单个写入线程（避免锁竞争）
+
     // 使用Rayon全局线程池
     files.par_iter().try_for_each(|entry| {
         let path = entry.path();
@@ -596,36 +616,58 @@ fn parallel_compress(
             .to_str()
             .map(|s| s.replace("\\", "/"))
             .ok_or_else(|| anyhow::anyhow!("路径包含无效字符"))?;
-        println!("name:{}", name);
-        // // 内存映射优化
-        // let mmap = unsafe { MmapOptions::new().map(&File::open(path)?) }?;
 
-        // // 分段写入锁优化
-        // {
-        //     let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
-        //     if path.is_file() {
-        //         writer.start_file(&name, options)?;
-        //         writer.write_all(&mmap)?;
-        //     } else if !name.is_empty() {
-        //         writer.add_directory(&name, options)?;
-        //     }
-        // }
+        // let path = entry.path();
+        // let name = path
+        //     .strip_prefix(src_dir)
+        //     .with_context(|| format!("路径 {:?} 不是前缀 {:?}", src_dir, path))?
+        //     .to_str()
+        //     .map(|s| s.replace("\\", "/"))
+        //     .ok_or_else(|| anyhow::anyhow!("路径包含无效字符"))?;
+        // let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        // let use_compression = file_size > small_file_threshold;
+        // println!("{}: {},{}", name, file_size, use_compression);
+        // println!("name:{},{:?}", name, path);
+
         // 修改3：限制锁作用域
         let result = (|| -> anyhow::Result<()> {
-            let mmap = unsafe { MmapOptions::new().map(&File::open(path)?) }?;
+            // let mmap = unsafe { MmapOptions::new().map(&File::open(path)?) }?;
 
             // 按间隔获取锁
             // if counter.load(Ordering::Relaxed) % write_lock_interval == 0 {
-            //     let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
-            //     if path.is_file() {
-            //         writer.start_file(&name, options)?;
-            //         writer.write_all(&mmap)?;
-            //     }
-            // } else {
-            //     // 无锁写入（需要确保线程安全）
-            //     let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
-            //     writer.write_all(&mmap)?;
-            // }
+            let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
+            if path.is_file() {
+                // 计算文件压缩时间，大小，并进行打印
+                let start = Instant::now();
+                let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let use_compression = file_size > small_file_threshold;
+                // println!("{}: {},{}", name, file_size, use_compression);
+                writer.start_file(&name, options)?;
+                writer.write_all(&std::fs::read(path)?)?;
+                let elapsed = start.elapsed();
+                // 打印秒数超过100ms的文件
+                if elapsed.as_millis() > 100 {
+                    log::warn!(
+                        "警告: 文件 {} 压缩时间较长: {} ms",
+                        name,
+                        elapsed.as_millis()
+                    );
+                }
+                log::info!(
+                    "{}: {} KB, {} ms",
+                    name,
+                    file_size / 1024,
+                    elapsed.as_millis()
+                );
+                // println!("name:{},{:?}", name, path);
+                // writer.start_file(&name, options)?;
+                // writer.write_all(&std::fs::read(path)?)?;
+                // }
+            } else {
+                // 无锁写入（需要确保线程安全）
+                let mut writer = zip.write().map_err(|_| anyhow::anyhow!("锁获取失败"))?;
+                writer.write_all(&std::fs::read(path)?)?;
+            }
             // // 修改4：强制释放内存映射
             // drop(mmap);
 

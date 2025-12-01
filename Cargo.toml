@@ -1,8 +1,10 @@
 [package]
-name = "zip"
+name = "sunrise-zip"
 version = "0.1.0"
 edition = "2021"
-
+[[bin]]
+name = "zip"
+path = "src/main.rs"
 [workspace.dependencies]
 time = { version = "0.3.37", default-features = false }
 
@@ -31,6 +33,10 @@ rayon = "1.5"
 memmap2 = "0.9.0"
 crossbeam-channel = "0.5.14"
 sysinfo = { version = "0.34.2", features = ["disk"] }
+log4rs = "1.4.0"
+log = "0.4.28"
+nu-ansi-term = "0.50.3"
+chrono = "0.4.42"
 [dev-dependencies]
 time = { workspace = true, features = ["formatting", "macros"] }
 
