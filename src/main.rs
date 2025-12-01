@@ -7,10 +7,11 @@ use std::result::Result::Ok;
 use std::sync::mpsc;
 use std::time::Instant;
 use sunrise_zip::compress::{CompressionStrategy, CompressionTask, CompressionWorker};
-use sunrise_zip::utils::create_progress_bar;
+use sunrise_zip::utils::{create_progress_bar, verify_zip};
 use walkdir::WalkDir;
 use zip_lib::ZipWriter;
 extern crate zip as zip_lib;
+use rayon::prelude::*;
 use sunrise_zip::log::init_logger;
 #[derive(Parser)]
 // #[command(about, long_about = None)]
@@ -31,6 +32,8 @@ struct Args {
     compression_level: i64,
     #[arg(long, default_value_t = 1024, help = "小文件阈值 (KB)")]
     small_file_threshold: u64,
+    #[arg(long, help = "是否显示验证信息")]
+    verbose: bool,
 }
 #[derive(Debug)]
 struct CompressedFile {
@@ -77,7 +80,12 @@ fn run() -> anyhow::Result<()> {
         args.threads,
     )?;
     println!("压缩完成，耗时: {:?}", start.elapsed());
-
+    // 验证压缩文件
+    if args.verbose {
+        log::info!("\n验证压缩文件...");
+        verify_zip(&args.destination)?;
+        log::info!("验证完成！");
+    }
     Ok(())
 }
 // fn real_main() -> i32 {
@@ -232,7 +240,7 @@ fn compress_directory(
     println!("压缩管道: {}", num_threads);
 
     // 创建压缩任务通道
-    let (tx, rx) = mpsc::sync_channel(num_threads * 2);
+    let (tx, rx) = mpsc::sync_channel::<CompressionTask>(num_threads * 2);
 
     // 创建压缩工作线程
     let file = std::fs::File::create(dst_file)?;
@@ -240,9 +248,7 @@ fn compress_directory(
     let strategy = CompressionStrategy::new(compression_level);
     let worker = CompressionWorker::new(writer, strategy, rx);
 
-    // 并行处理文件
-    use rayon::prelude::*;
-    files
+    match files
         .par_iter()
         .try_for_each(|entry| -> anyhow::Result<()> {
             let path = entry.path();
@@ -273,14 +279,22 @@ fn compress_directory(
 
             pb.inc(1);
             Ok(())
-        })?;
-
-    // 等待压缩完成
-    drop(tx); // 关闭发送端
-    let writer = worker.join()?;
-    let mut file = writer.finish()?;
-    file.flush()?;
-    pb.finish_with_message("完成");
+        }) {
+        Ok(_) => {
+            // 正常完成
+            drop(tx);
+            let writer = worker.join()?;
+            let mut file = writer.finish()?;
+            file.flush()?;
+            pb.finish_with_message("完成");
+        }
+        Err(e) => {
+            // 发生错误时的清理
+            drop(tx);
+            pb.abandon_with_message("压缩失败");
+            return Err(e);
+        }
+    }
 
     Ok(())
 }
