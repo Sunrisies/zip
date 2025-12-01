@@ -987,6 +987,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rawzip"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27cc19f82b641448e861623f52a6a6413bbc0595b62a9d45bf31ccdf18aab72c"
+
+[[package]]
 name = "rayon"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1204,9 +1210,11 @@ dependencies = [
  "nu-ansi-term",
  "pbkdf2",
  "rand 0.9.0",
+ "rawzip",
  "rayon",
  "sha1",
  "sysinfo",
+ "thiserror",
  "time",
  "walkdir",
  "zeroize",

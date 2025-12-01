@@ -37,6 +37,8 @@ log4rs = "1.4.0"
 log = "0.4.28"
 nu-ansi-term = "0.50.3"
 chrono = "0.4.42"
+rawzip = "0.4.2"
+thiserror = "2.0.17"
 [dev-dependencies]
 time = { workspace = true, features = ["formatting", "macros"] }
 
@@ -72,3 +74,18 @@ deflate-zlib = ["flate2/zlib", "deflate-flate2"]
 deflate-zlib-ng = ["flate2/zlib-ng", "deflate-flate2"]
 deflate-zopfli = ["zopfli", "_deflate-any"]
 constant_time_eq = ["dep:constant_time_eq"]
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3     # 使用最高优化级别
+lto = true        # 启用链接时优化
+codegen-units = 1 # 使用单个代码生成单元以获得更好的优化
+panic = "abort"   # 在 panic 时直接中止，减少二进制大小
+strip = true      # 自动剥离符号信息
+debug = false     # 不包含调试信息
+
+[profile.release.package."*"]
+opt-level = 3 # 为所有依赖启用最高优化级别
