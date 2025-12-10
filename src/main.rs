@@ -15,7 +15,17 @@ use rayon::prelude::*;
 use sunrise_zip::log::init_logger;
 #[derive(Parser)]
 // #[command(about, long_about = None)]
-#[command(about = "压缩文件目录", long_about = Some("将指定目录压缩为 zip 文件"))]
+#[command(
+    name = "sunrise-zip",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "压缩文件目录",
+    long_about = Some(
+        "将指定目录压缩为 zip 文件\n\n\
+        示例:\n\
+        zip /path/to/source /path/to/archive.zip\n\
+        zip -t 8 -l 9 /path/to/source /path/to/archive.zip"
+    ),
+)]
 struct Args {
     /// 源目录
     #[arg(help = "源目录的路径")]
